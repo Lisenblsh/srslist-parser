@@ -170,6 +170,11 @@ impl SrsGeoSite {
     pub fn contains(&self, domain: &str) -> bool {
         self.matcher.matches(domain)
     }
+
+    #[inline]
+    pub fn list(&self) -> (Vec<String>, Vec<String>) {
+        self.matcher.dump()
+    }
 }
 
 // ============================================================
@@ -244,6 +249,62 @@ impl Matcher {
 
             bm_idx += 1;
         }
+    }
+    /// Возвращает все домены, которые лежат в матчере.
+    ///
+    /// - `domains`  — точные совпадения (domain)
+    /// - `prefixes` — суффиксы / префиксы (domain_suffix)
+    pub fn dump(&self) -> (Vec<String>, Vec<String>) {
+        let mut domain_map = std::collections::HashMap::new();
+        let mut prefix_map = std::collections::HashMap::new();
+        let mut root_list = Vec::new();
+
+        for key in self.set.keys() {
+            let reversed = reverse_domain_bytes(&key);
+
+            if reversed.is_empty() {
+                continue;
+            }
+
+            match reversed[0] {
+                PREFIX_LABEL => {
+                    // \r + domain  →  prefix (domain_suffix)
+                    let s = String::from_utf8_lossy(&reversed[1..]).into_owned();
+                    prefix_map.insert(s, true);
+                }
+                ROOT_LABEL => {
+                    // \n + domain  →  root/suffix
+                    let s = String::from_utf8_lossy(&reversed[1..]).into_owned();
+                    root_list.push(s);
+                }
+                _ => {
+                    // обычный точный домен
+                    let s = String::from_utf8_lossy(&reversed).into_owned();
+                    domain_map.insert(s, true);
+                }
+            }
+        }
+
+        // Логика как в sing: если есть и точный домен, и prefix вида ".domain",
+        // то это считается domain_suffix.
+        for raw_prefix in prefix_map.keys() {
+            if let Some(rest) = raw_prefix.strip_prefix('.') {
+                if domain_map.remove(rest).is_some() {
+                    root_list.push(rest.to_string());
+                    continue;
+                }
+            }
+            root_list.push(raw_prefix.clone());
+        }
+
+        let mut domains: Vec<String> = domain_map.into_keys().collect();
+        let mut prefixes = root_list;
+
+        domains.sort();
+        prefixes.sort();
+        prefixes.dedup();
+
+        (domains, prefixes)
     }
 }
 
@@ -359,6 +420,58 @@ impl SuccinctSet {
 
         panic!("select_ith_one: index out of range");
     }
+    /// Восстанавливает все ключи, которые были закодированы в set.
+    pub fn keys(&self) -> Vec<Vec<u8>> {
+        let mut result = Vec::new();
+        let mut current = Vec::new();
+
+        self.traverse(0, 0, &mut current, &mut result);
+        result
+    }
+
+    fn traverse(
+        &self,
+        node_id: usize,
+        mut bm_idx: usize,
+        current: &mut Vec<u8>,
+        result: &mut Vec<Vec<u8>>,
+    ) {
+        // лист?
+        if self.get_leaf(node_id) {
+            result.push(current.clone());
+        }
+
+        loop {
+            if self.get_bit(bm_idx) != 0 {
+                return; // конец детей этого узла
+            }
+
+            let next_label = self.labels[bm_idx - node_id];
+            current.push(next_label);
+
+            let next_node_id = self.count_zeros(bm_idx + 1);
+            let next_bm_idx = self.select_ith_one(next_node_id - 1) + 1;
+
+            self.traverse(next_node_id, next_bm_idx, current, result);
+
+            current.pop();
+            bm_idx += 1;
+        }
+    }
+}
+
+/// Разворачивает байты так же, как reverse_domain, но работает с &[u8]
+fn reverse_domain_bytes(data: &[u8]) -> Vec<u8> {
+    // data уже в "перевёрнутом" виде (как хранится внутри set),
+    // поэтому просто делаем UTF-8 safe reverse
+    let s = String::from_utf8_lossy(data);
+    let mut result = Vec::with_capacity(data.len());
+    for ch in s.chars().rev() {
+        let mut buf = [0u8; 4];
+        let encoded = ch.encode_utf8(&mut buf);
+        result.extend_from_slice(encoded.as_bytes());
+    }
+    result
 }
 
 // ============================================================
